@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Event Horizon</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden}
+  canvas{display:block;width:100vw;height:100vh;cursor:grab;touch-action:none}
+  canvas:active{cursor:grabbing}
+  #hud{position:fixed;left:24px;bottom:20px;color:#e8d9c4;font:12px/1.6 ui-monospace,Menlo,Consolas,monospace;
+       letter-spacing:.08em;opacity:.6;pointer-events:none;text-shadow:0 0 8px #000}
+  #hud b{display:block;font-size:15px;letter-spacing:.35em;color:#fff;font-weight:600}
+  #err{position:fixed;inset:0;display:none;align-items:center;justify-content:center;color:#f88;font:14px monospace;white-space:pre-wrap;padding:24px}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud"><b>EVENT HORIZON</b>드래그: 시점 회전 · 휠: 줌 · 더블클릭: 자동 회전 켜기/끄기</div>
+<div id="err"></div>
+<script id="fs" type="x-shader/x-fragment">
+precision highp float;
+uniform vec2 uRes;
+uniform float uTime;
+uniform vec3 uCam;     // yaw, pitch, dist
+
+const float RIN = 2.6;   // 원반 안쪽 반지름 (슈바르츠실트 반지름 = 1)
+const float ROUT = 10.0;
+const int STEPS = 260;
+
+float hash(vec3 p){ p = fract(p*0.3183099+.1); p *= 17.0; return fract(p.x*p.y*p.z*(p.x+p.y+p.z)); }
+float noise(vec3 x){
+  vec3 i = floor(x), f = fract(x); f = f*f*(3.0-2.0*f);
+  return mix(mix(mix(hash(i),hash(i+vec3(1,0,0)),f.x), mix(hash(i+vec3(0,1,0)),hash(i+vec3(1,1,0)),f.x),f.y),
+             mix(mix(hash(i+vec3(0,0,1)),hash(i+vec3(1,0,1)),f.x), mix(hash(i+vec3(0,1,1)),hash(i+vec3(1,1,1)),f.x),f.y),f.z);
+}
+float fbm(vec3 p){
+  float a = .5, s = 0.;
+  for(int i=0;i<5;i++){ s += a*noise(p); p = p*2.03+vec3(1.7,9.2,3.1); a *= .5; }
+  return s;
+}
+
+// 배경: 별 + 성운
+vec3 stars(vec3 d){
+  vec3 col = vec3(0.);
+  for(int l=0;l<3;l++){
+    float sc = 40.0 + float(l)*45.0;
+    vec3 q = d*sc, id = floor(q);
+    float h = hash(id + float(l)*13.7);
+    if(h > 0.90){
+      vec3 c = id + .5 + (vec3(hash(id+1.3),hash(id+2.7),hash(id+4.1))-.5)*.6;
+      float dist = length(q-c);
+      float b = pow((h-0.90)*10.0, 3.0);
+      float tw = .75+.25*sin(uTime*(1.+h*3.)+h*60.);
+      vec3 tint = mix(vec3(1.,.82,.65), vec3(.7,.82,1.), hash(id+7.7));
+      col += tint * b * tw * 2.2 * exp(-dist*dist*28.0);
+    }
+  }
+  float n = fbm(d*2.2+vec3(3.,1.,7.));
+  float n2 = fbm(d*4.0-vec3(2.,5.,1.));
+  vec3 neb = vec3(.20,.09,.42)*pow(n,3.0)*1.3 + vec3(.04,.26,.34)*pow(n2,4.0)*1.2;
+  return col + neb*.24;
+}
+
+// 강착 원반의 한 점에서 나오는 빛
+vec4 disk(vec3 p, vec3 rayDir){
+  float r = length(p.xz);
+  if(r < RIN || r > ROUT) return vec4(0.);
+  float x = (r-RIN)/(ROUT-RIN);
+  float edge = smoothstep(0.,.05,x) * (1.-smoothstep(.45,1.,x));
+
+  // 케플러 회전(안쪽이 빠름)을 두 위상으로 섞어 끊김 없이 흐르게 함
+  float om = 5.0*pow(r,-1.5);
+  float T = 7.0, ph = uTime/T;
+  float n = 0.;
+  for(int k=0;k<2;k++){
+    float f = fract(ph + float(k)*.5);
+    float w = 1.-abs(2.*f-1.);
+    float a = om*(f*T + 5.0);
+    float c = cos(a), s = sin(a);
+    vec2 q = mat2(c,-s,s,c)*p.xz;
+    float v = fbm(vec3(q*1.15, r*.35 + float(k)*9.)) ;
+    v += .5*noise(vec3(q*4.5, float(k)*5.+r));
+    n += w*v;
+  }
+  n = smoothstep(.35, 1.15, n);
+  float bands = .75+.25*sin(r*9.0+n*4.);
+  float dens = edge*(.25+.9*n)*bands;
+
+  // 도플러 효과: 다가오는 쪽은 밝고 푸르게, 멀어지는 쪽은 어둡고 붉게
+  float beta = sqrt(.5/r);
+  vec3 vd = normalize(vec3(-p.z,0.,p.x))*beta;
+  float D = sqrt(1.-beta*beta)/(1.-dot(vd,-rayDir));
+  D *= sqrt(max(1.-1./r,0.));           // 중력 적색편이
+
+  float t = D*pow(RIN/r,.75)*1.25;
+  vec3 c = mix(vec3(1.,.16,.02), vec3(1.,.55,.18), smoothstep(.25,.65,t));
+  c = mix(c, vec3(1.,.86,.62), smoothstep(.6,1.0,t));
+  c = mix(c, vec3(.82,.9,1.), smoothstep(1.0,1.6,t));
+  float I = pow(RIN/r,2.4)*pow(D,3.0)*1.8;
+  return vec4(c*I*dens, clamp(dens*1.3,0.,1.));
+}
+
+void main(){
+  vec2 uv = (gl_FragCoord.xy - .5*uRes)/uRes.y;
+  float yaw = uCam.x, pitch = uCam.y, dist = uCam.z;
+  vec3 ro = dist*vec3(cos(pitch)*sin(yaw), sin(pitch), cos(pitch)*cos(yaw));
+  vec3 fw = normalize(-ro);
+  vec3 up0 = normalize(vec3(.16,1.,0.));          // 살짝 기울인 화면
+  vec3 rt = normalize(cross(fw,up0)), up = cross(rt,fw);
+  vec3 v = normalize(fw*2.2 + rt*uv.x + up*uv.y);
+  vec3 p = ro;
+
+  float h2 = dot(cross(p,v),cross(p,v));          // 각운동량² (보존량)
+  vec3 col = vec3(0.);
+  float trans = 1.;
+  float glow = 0.;
+  bool escaped = false;
+
+  for(int i=0;i<STEPS;i++){
+    float r = length(p);
+    if(r < 1.0){ trans = 0.; break; }              // 사건의 지평선: 빛이 못 나옴
+    if(r > dist+12.0 && dot(p,v) > 0.){ escaped = true; break; }
+    float dt = clamp(.07*(r-.85), .015, 1.2);
+    // 슈바르츠실트 시공간에서 빛의 측지선 (광자 궤도 방정식)
+    vec3 acc = -1.5*h2*p/pow(r,5.);
+    v += acc*dt;
+    vec3 np = p + v*dt;
+    if(p.y*np.y < 0.){
+      vec3 hit = mix(p,np, p.y/(p.y-np.y));
+      vec4 d = disk(hit, normalize(v));
+      col += trans*d.rgb;
+      trans *= 1.-d.a;
+    }
+    float rc = length(np.xz);
+    glow += dt*exp(-abs(np.y)*2.2)*pow(RIN/max(rc,RIN),3.)*smoothstep(1.2,RIN,rc);
+    p = np;
+    if(trans < .01) break;
+  }
+  if(!escaped && trans > 0.) escaped = length(p) > 3.;
+  if(escaped) col += trans*stars(normalize(v));
+  col += vec3(1.,.5,.2)*glow*.012;
+
+  // 톤 매핑 (ACES 근사) + 비네트
+  col *= 1.15;
+  col = (col*(2.51*col+.03))/(col*(2.43*col+.59)+.14);
+  col = pow(clamp(col,0.,1.), vec3(.4545));
+  col *= 1.-.35*dot(uv,uv);
+  col += (hash(vec3(gl_FragCoord.xy,uTime))-.5)/255.;   // 디더링
+  gl_FragColor = vec4(col,1.);
+}
+</script>
+<script>
+(function(){
+  const cv = document.getElementById('c');
+  const gl = cv.getContext('webgl', {antialias:false, preserveDrawingBuffer:true});
+  const fail = m => { const e=document.getElementById('err'); e.style.display='flex'; e.textContent=m; };
+  if(!gl) return fail('WebGL을 사용할 수 없습니다.');
+
+  const sh = (type, src) => {
+    const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+    if(!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+    return s;
+  };
+  let prog;
+  try {
+    prog = gl.createProgram();
+    gl.attachShader(prog, sh(gl.VERTEX_SHADER, 'attribute vec2 a;void main(){gl_Position=vec4(a,0.,1.);}'));
+    gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, document.getElementById('fs').textContent));
+    gl.linkProgram(prog);
+    if(!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+  } catch(e){ return fail('셰이더 오류:\n'+e.message); }
+  gl.useProgram(prog);
+  gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1,3,-1,-1,3]), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0); gl.bindAttribLocation(prog,0,'a');
+  gl.vertexAttribPointer(0,2,gl.FLOAT,false,0,0);
+  const uRes = gl.getUniformLocation(prog,'uRes'), uTime = gl.getUniformLocation(prog,'uTime'), uCam = gl.getUniformLocation(prog,'uCam');
+
+  let scale = Math.min(window.devicePixelRatio||1, 1);
+  const resize = () => {
+    const w = Math.max(1, Math.round(innerWidth*scale)), h = Math.max(1, Math.round(innerHeight*scale));
+    if(cv.width!==w || cv.height!==h){ cv.width=w; cv.height=h; gl.viewport(0,0,w,h); }
+  };
+  addEventListener('resize', resize); resize();
+
+  let yaw = 0.5, pitch = 0.105, dist = 28, tYaw = yaw, tPitch = pitch, tDist = dist, auto = true;
+  let drag = null;
+  cv.addEventListener('pointerdown', e => { drag = {x:e.clientX, y:e.clientY}; cv.setPointerCapture(e.pointerId); });
+  cv.addEventListener('pointermove', e => {
+    if(!drag) return;
+    tYaw -= (e.clientX-drag.x)*0.005;
+    tPitch = Math.max(-1.45, Math.min(1.45, tPitch + (e.clientY-drag.y)*0.005));
+    drag = {x:e.clientX, y:e.clientY};
+  });
+  cv.addEventListener('pointerup', () => drag = null);
+  cv.addEventListener('pointercancel', () => drag = null);
+  cv.addEventListener('wheel', e => { e.preventDefault(); tDist = Math.max(8, Math.min(70, tDist*Math.exp(e.deltaY*0.001))); }, {passive:false});
+  cv.addEventListener('dblclick', () => auto = !auto);
+
+  // 프레임이 느리면 해상도를 자동으로 낮춤
+  let last = performance.now(), slow = 0, fast = 0;
+  const t0 = last;
+  function frame(now){
+    const dt = now-last; last = now;
+    if(dt > 45){ if(++slow > 20 && scale > 0.4){ scale *= 0.8; slow = 0; resize(); } } else slow = Math.max(0, slow-1);
+    if(auto && !drag) tYaw += Math.min(dt,100)*0.00004;
+    yaw += (tYaw-yaw)*0.12; pitch += (tPitch-pitch)*0.12; dist += (tDist-dist)*0.12;
+    gl.uniform2f(uRes, cv.width, cv.height);
+    gl.uniform1f(uTime, (now-t0)/1000);
+    gl.uniform3f(uCam, yaw, pitch, dist);
+    gl.drawArrays(gl.TRIANGLES,0,3);
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
